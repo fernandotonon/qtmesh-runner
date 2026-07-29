@@ -209,12 +209,35 @@ const OPERATIONS = {
 
     const reportPath = path.join(ctx.outDir, 'report.json');
     writeFileSync(reportPath, JSON.stringify(report, null, 2));
+
+    // Distill a datasheet for the site (full detail stays in the report
+    // artifact). Only REAL values from the CLI — absent data stays absent.
+    const meshInfo = report.info || {};
+    const anims = Array.isArray(report.animations) ? report.animations
+      : Array.isArray(meshInfo.animations) ? meshInfo.animations : [];
+    const matName = (m) => typeof m === 'string' ? m : (m && (m.name || m.material)) ? String(m.name || m.material) : null;
+    const datasheet = {
+      vertices: typeof meshInfo.vertices === 'number' ? meshInfo.vertices : null,
+      triangles: typeof meshInfo.triangles === 'number' ? meshInfo.triangles : null,
+      submeshes: typeof meshInfo.submeshes === 'number' ? meshInfo.submeshes : null,
+      upAxis: typeof meshInfo.upAxis === 'string' ? meshInfo.upAxis : null,
+      boundingBox: meshInfo.boundingBox && Array.isArray(meshInfo.boundingBox.min) ? meshInfo.boundingBox : null,
+      materials: Array.isArray(meshInfo.materials) ? meshInfo.materials.map(matName).filter(Boolean).slice(0, 50) : [],
+      textures: Array.isArray(meshInfo.textures) ? meshInfo.textures.map(String).slice(0, 50) : [],
+      boneCount: meshInfo.skeleton && typeof meshInfo.skeleton.boneCount === 'number' ? meshInfo.skeleton.boneCount : null,
+      skeletonName: meshInfo.skeleton && meshInfo.skeleton.name ? String(meshInfo.skeleton.name) : null,
+      animations: anims
+        .filter((a) => a && a.name)
+        .slice(0, 100)
+        .map((a) => ({ name: String(a.name).slice(0, 120), duration: typeof a.duration === 'number' ? Math.round(a.duration * 100) / 100 : null })),
+      hasErrors: val.code !== 0,
+    };
     return {
       artifacts: { report: reportPath },
       result: {
         analyzed: true,
         hasErrors: val.code !== 0,
-        meshInfo: report.info ? true : false,
+        datasheet,
       },
     };
   },
