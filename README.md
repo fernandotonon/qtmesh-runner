@@ -8,23 +8,64 @@ Epic: [#1](https://github.com/fernandotonon/qtmesh-runner/issues/1) · Backend: 
 
 Requirements: Node ≥ 20, plus **either** Docker (uses `ghcr.io/fernandotonon/qtmesh:latest`) **or** a native `qtmesh` binary.
 
-```bash
-# 1. An admin mints a runner token on QtMesh Cloud:
-#    POST /v1/admin/runner-tokens { "name": "my-linux-pc" }  → qtm_run_...
+### 1. Mint a runner token (admin)
 
-# 2. Run the agent:
+Runner tokens are minted by a QtMesh Cloud admin. First get a **personal API token** for yourself: sign in at [qtmesh.dev](https://qtmesh.dev) → user menu → **API & tokens** → *Personal API tokens* → Create (copy the `qtm_pat_…` value — it is shown once).
+
+Then mint the runner token with it:
+
+```bash
+curl -s -X POST https://api.qtmesh.dev/v1/admin/runner-tokens \
+  -H "authorization: Bearer qtm_pat_..." \
+  -H "content-type: application/json" \
+  -d '{"name":"my-linux-pc"}'
+# → { "ok": true, "token": "qtm_run_...", ... }   (also shown once — store it)
+```
+
+For CI / shared environments, mint a **restricted** token instead — it can only claim jobs on public assets and only the listed operations:
+
+```bash
+curl -s -X POST https://api.qtmesh.dev/v1/admin/runner-tokens \
+  -H "authorization: Bearer qtm_pat_..." \
+  -H "content-type: application/json" \
+  -d '{"name":"github-actions","restrictions":{"allowPrivateAssets":false,"allowedOperations":["analyze-asset","generate-thumbnail"],"maxClaimBatch":10}}'
+```
+
+Revoke a token anytime: `DELETE /v1/admin/runner-tokens/:id`.
+
+### 2. Instantiate a runner
+
+Clone this repo on the machine, then:
+
+**Persistent worker** (home PC / server — keeps polling until stopped):
+
+```bash
+git clone https://github.com/fernandotonon/qtmesh-runner && cd qtmesh-runner
+
 QTMESH_API_URL=https://api.qtmesh.dev \
 QTMESH_RUNNER_TOKEN=qtm_run_... \
+QTMESH_RUNNER_NAME=my-linux-pc \
 node agent.mjs run --continuous
 ```
 
-Batch mode (CI / cron):
+By default jobs execute in the locked-down Docker image. On a machine with a native `qtmesh` build (e.g. a Mac), skip Docker entirely:
+
+```bash
+QTMESH_API_URL=https://api.qtmesh.dev \
+QTMESH_RUNNER_TOKEN=qtm_run_... \
+QTMESH_NATIVE_QTMESH=$HOME/QtMeshEditor/build_local/bin/qtmesh \
+node agent.mjs run --continuous
+```
+
+**Batch worker** (CI / cron — drains eligible jobs, then exits):
 
 ```bash
 node agent.mjs run --max-jobs 10 --exit-when-empty
 ```
 
-Other commands: `node agent.mjs capabilities` · `node agent.mjs health`
+Sanity checks: `node agent.mjs capabilities` (what this machine will advertise) · `node agent.mjs health` (config + executor).
+
+The runner shows up under `GET /v1/admin/runners` after its first registration; stopping it is always safe — any in-flight job's lease expires server-side and the job is retried elsewhere.
 
 ## Configuration (env)
 
