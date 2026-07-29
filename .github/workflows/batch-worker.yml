@@ -30,4 +30,6 @@ jobs:
           QTMESH_RUNNER_TOKEN: ${{ secrets.QTMESH_RUNNER_TOKEN }}
           QTMESH_RUNNER_NAME: github-actions
           QTMESH_EPHEMERAL: "1"
+          QTMESH_CAPABILITIES: cpu,linux-container,quality-analysis,format-conversion
+          QTMESH_POLL_INTERVAL: "5"
         run: node agent.mjs run --max-jobs 10 --exit-when-empty
