@@ -109,7 +109,12 @@ Stop/remove: `launchctl bootout gui/$(id -u)/com.qtmesh.runner`.
 | `QTMESH_POLL_INTERVAL` | 30 | seconds between empty claims |
 | `QTMESH_WORK_DIR` | os tmp | per-job scratch (wiped after each job) |
 | `QTMESH_JOB_TIMEOUT` | 600 | seconds per job |
-| `QTMESH_EPHEMERAL` | — | `1` for CI workers |
+| `QTMESH_EPHEMERAL` | — | `1` for CI workers (also disables eligibility checks) |
+| `QTMESH_ELIGIBILITY` | on | `off` disables all eligibility gating |
+| `QTMESH_REQUIRE_AC` | `1` on macOS | pause claiming on battery power |
+| `QTMESH_MAX_LOAD` | cpu cores | pause claiming above this 1-min load average |
+| `QTMESH_MIN_FREE_GB` | 5 | pause claiming below this free disk space |
+| `QTMESH_PAUSE_FILE` | `~/.qtmesh-runner/paused` | `touch` it to pause, delete to resume |
 
 ## How it works
 
@@ -119,12 +124,24 @@ Stop/remove: `launchctl bootout gui/$(id -u)/com.qtmesh.runner`.
 4. Inputs stream from the API; artifacts stream back to it. No storage credentials on the machine.
 5. Untrusted assets execute in a locked-down container (`--network=none --cap-drop=ALL --memory=4g …`) or the native CLI; each job gets a fresh workdir, deleted afterwards.
 
-## Supported operations (v1)
+## Supported operations
 
 | operation | tool | output |
 |---|---|---|
-| `analyze-asset` | `qtmesh info/validate/anim --json` | `report.json` |
+| `analyze-asset` | `qtmesh info/validate/anim --json` | `report.json` + datasheet (auto-enqueued on publish & web uploads) |
 | `generate-thumbnail` | `qtmesh turntable --frames 1` | `thumbnail.png` (auto-attaches to marketplace listings) |
+| `optimize-mesh` | `qtmesh fix` | `fixed-model` |
+| `convert-format` | `qtmesh convert` | `converted-model` (params: `targetFormat`) |
+| `generate-lods` | `qtmesh lod` | `lod1..lod3` (params: `count`, `algo`) |
+| `render-turntable` / `render-sprite-sheet` | `qtmesh turntable` | sprite sheet png (+ metadata json) |
+
+## Laptop etiquette (eligibility)
+
+Non-ephemeral runners pause claiming while on battery (macOS), under high
+load, low on disk, or when the pause file exists — checked before every
+claim, logged once per state change, all thresholds configurable (table
+above). In-flight jobs are never killed by eligibility; it only stops new
+claims.
 
 ## GitHub Actions
 

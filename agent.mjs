@@ -23,7 +23,7 @@
 //   QTMESH_EPHEMERAL        "1" for CI workers
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync, statfsSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -264,7 +264,81 @@ const OPERATIONS = {
     if (!existsSync(thumbPath)) throw new JobError('render_failed', 'turntable produced no output', false);
     return { artifacts: { thumbnail: thumbPath }, result: { rendered: true, size } };
   },
+
+  async 'optimize-mesh'(job, ctx) {
+    const input = `{IN}/${ctx.inputName}`;
+    const ext = (path.extname(ctx.inputName).slice(1) || 'fbx').toLowerCase();
+    const out = await qtmesh(['fix', input, '-o', `{OUT}/fixed.${ext}`], ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh fix timed out', true);
+    ensureExecutorOk(out, 'qtmesh fix');
+    if (out.code !== 0) throw new JobError('invalid_asset', `qtmesh fix failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const fixedPath = path.join(ctx.outDir, `fixed.${ext}`);
+    if (!existsSync(fixedPath)) throw new JobError('invalid_asset', 'fix produced no output', false);
+    return { artifacts: { 'fixed-model': fixedPath }, result: { fixed: true, summary: out.stdout.slice(0, 500) } };
+  },
+
+  async 'convert-format'(job, ctx) {
+    const input = `{IN}/${ctx.inputName}`;
+    const target = String(job.params?.targetFormat || 'glb').toLowerCase().replace(/[^a-z]/g, '') || 'glb';
+    const out = await qtmesh(['convert', input, '-o', `{OUT}/converted.${target}`], ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh convert timed out', true);
+    ensureExecutorOk(out, 'qtmesh convert');
+    if (out.code !== 0) throw new JobError('unsupported_format', `convert failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const convertedPath = path.join(ctx.outDir, `converted.${target}`);
+    if (!existsSync(convertedPath)) throw new JobError('unsupported_format', 'convert produced no output', false);
+    return { artifacts: { 'converted-model': convertedPath }, result: { targetFormat: target } };
+  },
+
+  async 'generate-lods'(job, ctx) {
+    const input = `{IN}/${ctx.inputName}`;
+    const ext = (path.extname(ctx.inputName).slice(1) || 'fbx').toLowerCase();
+    const count = Math.min(3, Math.max(1, parseInt(job.params?.count, 10) || 2));
+    const algo = ['ogre', 'meshopt'].includes(String(job.params?.algo)) ? String(job.params.algo) : 'meshopt';
+    const out = await qtmesh(['lod', input, '--count', String(count), '--algo', algo, '-o', `{OUT}/model.${ext}`], ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh lod timed out', true);
+    ensureExecutorOk(out, 'qtmesh lod');
+    if (out.code !== 0) throw new JobError('invalid_asset', `lod failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const artifacts = {};
+    for (let i = 1; i <= count; i++) {
+      const lodPath = path.join(ctx.outDir, `model_lod${i}.${ext}`);
+      if (existsSync(lodPath)) artifacts[`lod${i}`] = lodPath;
+    }
+    if (!artifacts.lod1) throw new JobError('invalid_asset', 'lod produced no output', false);
+    return { artifacts, result: { count: Object.keys(artifacts).length, algo } };
+  },
+
+  async 'render-turntable'(job, ctx) {
+    return renderSheet(job, ctx, 'turntable', { frames: 12, columns: 12 });
+  },
+
+  async 'render-sprite-sheet'(job, ctx) {
+    return renderSheet(job, ctx, 'sprite-sheet', { frames: 16, columns: 4 });
+  },
 };
+
+// Shared turntable-based sheet renderer for render-turntable / render-sprite-sheet.
+async function renderSheet(job, ctx, artifactType, defaults) {
+  const input = `{IN}/${ctx.inputName}`;
+  const p = job.params || {};
+  const frames = Math.min(36, Math.max(1, parseInt(p.frames, 10) || defaults.frames));
+  const columns = Math.min(12, Math.max(1, parseInt(p.columns, 10) || defaults.columns));
+  const size = typeof p.size === 'string' && /^\d{2,4}x\d{2,4}$/.test(p.size) ? p.size : '256x256';
+  const args = ['turntable', input, '-o', '{OUT}/sheet.png', '--frames', String(frames), '--columns', String(columns), '--size', size];
+  if (p.elevation !== undefined && !isNaN(Number(p.elevation))) args.push('--elevation', String(Number(p.elevation)));
+  const out = await qtmesh(args, ctx);
+  if (out.timedOut) throw new JobError('processor_timeout', 'turntable timed out', true);
+  ensureExecutorOk(out, 'turntable');
+  if (out.code !== 0) throw new JobError('render_failed', `turntable failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+  const sheetPath = path.join(ctx.outDir, 'sheet.png');
+  if (!existsSync(sheetPath)) throw new JobError('render_failed', 'turntable produced no output', false);
+  const artifacts = { [artifactType]: sheetPath };
+  if (artifactType === 'sprite-sheet') {
+    const metaPath = path.join(ctx.outDir, 'sprite-metadata.json');
+    writeFileSync(metaPath, JSON.stringify({ frames, columns, rows: Math.ceil(frames / columns), frameSize: size }, null, 2));
+    artifacts['sprite-metadata'] = metaPath;
+  }
+  return { artifacts, result: { frames, columns, size } };
+}
 
 // ---- job processing -----------------------------------------------------------
 
@@ -351,6 +425,35 @@ async function processJob(claim) {
 
 let executorBroken = false;
 
+// ---- eligibility (personal machines) ----------------------------------------
+// A laptop should not silently chew battery/CPU: unless the runner is
+// ephemeral (CI) or checks are disabled, claiming pauses while on battery,
+// under load, low on disk, or manually paused. All thresholds configurable.
+const elig = {
+  disabled: process.env.QTMESH_ELIGIBILITY === 'off',
+  requireAC: process.env.QTMESH_REQUIRE_AC !== '0' && process.platform === 'darwin',
+  maxLoad: Number(process.env.QTMESH_MAX_LOAD || os.cpus().length),
+  minFreeGb: Number(process.env.QTMESH_MIN_FREE_GB || 5),
+  pauseFile: process.env.QTMESH_PAUSE_FILE || path.join(os.homedir(), '.qtmesh-runner', 'paused'),
+};
+
+async function eligibilityBlockReason() {
+  if (elig.disabled || cfg.ephemeral) return null;
+  if (existsSync(elig.pauseFile)) return `paused (${elig.pauseFile} exists)`;
+  const load = os.loadavg()[0];
+  if (load > elig.maxLoad) return `system load ${load.toFixed(1)} > ${elig.maxLoad}`;
+  try {
+    const st = statfsSync(cfg.workDir);
+    const freeGb = (st.bavail * st.bsize) / 1e9;
+    if (freeGb < elig.minFreeGb) return `free disk ${freeGb.toFixed(1)}GB < ${elig.minFreeGb}GB`;
+  } catch { /* statfs unsupported — skip the disk check */ }
+  if (elig.requireAC) {
+    const batt = await runProcess('pmset', ['-g', 'batt'], { timeoutMs: 5000 });
+    if (batt.code === 0 && /Battery Power/i.test(batt.stdout)) return 'on battery power';
+  }
+  return null;
+}
+
 // Refuse to claim anything if the executor can't run — a broken executor must
 // never convert queued jobs into failures.
 async function preflightExecutor() {
@@ -392,7 +495,17 @@ async function mainLoop() {
   let processed = 0;
   const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
+  let lastBlockReason = '';
   for (;;) {
+    const blockReason = await eligibilityBlockReason();
+    if (blockReason) {
+      if (blockReason !== lastBlockReason) log('claiming paused', { reason: blockReason });
+      lastBlockReason = blockReason;
+      if (cfg.exitWhenEmpty) break;
+      await sleep(cfg.pollInterval);
+      continue;
+    }
+    if (lastBlockReason) { log('claiming resumed', {}); lastBlockReason = ''; }
     let claim = null;
     try {
       claim = await api('/v1/runner/claim', { body: { runnerId } });
