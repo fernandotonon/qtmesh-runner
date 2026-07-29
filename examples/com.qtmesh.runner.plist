@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  QtMesh Runner - launchd agent (macOS). Starts at login, restarts on crash.
+
+  Install (adjust paths first: repo location, node path from `which node`,
+  your qtm_run_ token, and optionally QTMESH_NATIVE_QTMESH):
+    cp examples/com.qtmesh.runner.plist ~/Library/LaunchAgents/
+    $EDITOR ~/Library/LaunchAgents/com.qtmesh.runner.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.qtmesh.runner.plist
+
+  Stop/remove:
+    launchctl bootout gui/$(id -u)/com.qtmesh.runner
+  Logs:
+    tail -f ~/Library/Logs/qtmesh-runner.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.qtmesh.runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>agent.mjs</string>
+    <string>run</string>
+    <string>--continuous</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/CHANGE_ME/qtmesh-runner</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>QTMESH_API_URL</key>
+    <string>https://api.qtmesh.dev</string>
+    <key>QTMESH_RUNNER_TOKEN</key>
+    <string>qtm_run_replace_me</string>
+    <key>QTMESH_RUNNER_NAME</key>
+    <string>my-macbook</string>
+    <key>QTMESH_NATIVE_QTMESH</key>
+    <string>/Users/CHANGE_ME/QtMeshEditor/build_local/bin/qtmesh</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/CHANGE_ME/Library/Logs/qtmesh-runner.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/CHANGE_ME/Library/Logs/qtmesh-runner.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>10</integer>
+</dict>
+</plist>

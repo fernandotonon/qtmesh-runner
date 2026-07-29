@@ -1,0 +1,38 @@
+# QtMesh Runner — systemd unit (Linux).
+#
+# Install:
+#   sudo useradd -r -m -s /usr/sbin/nologin qtmesh          # once
+#   sudo git clone https://github.com/fernandotonon/qtmesh-runner /opt/qtmesh-runner
+#   sudo cp /opt/qtmesh-runner/examples/qtmesh-runner.env.example /etc/qtmesh-runner.env
+#   sudo chmod 600 /etc/qtmesh-runner.env                    # token lives here
+#   $EDITOR /etc/qtmesh-runner.env
+#   sudo cp /opt/qtmesh-runner/examples/qtmesh-runner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now qtmesh-runner
+#
+# Logs:   journalctl -u qtmesh-runner -f
+# Docker executor: add the service user to the docker group
+#   (sudo usermod -aG docker qtmesh) or set QTMESH_NATIVE_QTMESH in the env file.
+
+[Unit]
+Description=QtMesh Runner (async job agent for QtMesh Cloud)
+Documentation=https://github.com/fernandotonon/qtmesh-runner
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qtmesh
+EnvironmentFile=/etc/qtmesh-runner.env
+WorkingDirectory=/opt/qtmesh-runner
+ExecStart=/usr/bin/env node agent.mjs run --continuous
+Restart=always
+RestartSec=10
+# Hardening (the job itself is further isolated inside the Docker processor)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

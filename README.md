@@ -67,6 +67,35 @@ Sanity checks: `node agent.mjs capabilities` (what this machine will advertise) 
 
 The runner shows up under `GET /v1/admin/runners` after its first registration; stopping it is always safe — any in-flight job's lease expires server-side and the job is retried elsewhere.
 
+### 3. Run as a service (auto-start + auto-restart)
+
+Templates live in [`examples/`](examples/). Both restart the agent on crash and start it on boot/login; killing the machine mid-job is safe (lease recovery).
+
+**Linux (systemd)** — [`examples/qtmesh-runner.service`](examples/qtmesh-runner.service):
+
+```bash
+sudo useradd -r -m -s /usr/sbin/nologin qtmesh
+sudo git clone https://github.com/fernandotonon/qtmesh-runner /opt/qtmesh-runner
+sudo cp /opt/qtmesh-runner/examples/qtmesh-runner.env.example /etc/qtmesh-runner.env
+sudo chmod 600 /etc/qtmesh-runner.env && sudo $EDITOR /etc/qtmesh-runner.env   # token goes here
+sudo cp /opt/qtmesh-runner/examples/qtmesh-runner.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now qtmesh-runner
+journalctl -u qtmesh-runner -f          # logs
+```
+
+Using the Docker executor? Add the service user to the docker group (`sudo usermod -aG docker qtmesh`), or set `QTMESH_NATIVE_QTMESH` in the env file instead.
+
+**macOS (launchd)** — [`examples/com.qtmesh.runner.plist`](examples/com.qtmesh.runner.plist), runs at login and restarts on crash:
+
+```bash
+cp examples/com.qtmesh.runner.plist ~/Library/LaunchAgents/
+$EDITOR ~/Library/LaunchAgents/com.qtmesh.runner.plist   # set repo path, node path (`which node`), token
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.qtmesh.runner.plist
+tail -f ~/Library/Logs/qtmesh-runner.log                 # logs
+```
+
+Stop/remove: `launchctl bootout gui/$(id -u)/com.qtmesh.runner`.
+
 ## Configuration (env)
 
 | Var | Default | |
