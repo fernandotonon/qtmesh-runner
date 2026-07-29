@@ -1,0 +1,9 @@
+{
+  "name": "qtmesh-runner",
+  "version": "0.1.0",
+  "description": "Runner agent for asynchronous QtMesh Cloud jobs",
+  "type": "module",
+  "bin": { "qtmesh-runner": "./agent.mjs" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
