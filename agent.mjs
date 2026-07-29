@@ -164,6 +164,21 @@ async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
 // Each adapter runs the CLI and returns { artifacts: {type: filePath}, result }.
 // Throwing JobError with retryable=false marks the job permanently failed.
 
+// Environment/executor failures (docker daemon down, binary missing) must
+// NEVER permafail a job — they are retryable infrastructure errors, and the
+// agent stops claiming instead of draining the queue into failures.
+function isExecutorFailure(out) {
+  const hay = `${out.stderr || ''}\n${out.stdout || ''}`;
+  return out.code === -1 ||
+    /docker API|Docker daemon|docker\.sock|Cannot connect to the Docker|command not found|No such file or directory: .*docker|ENOENT/i.test(hay);
+}
+
+function ensureExecutorOk(out, what) {
+  if (isExecutorFailure(out)) {
+    throw new JobError('executor_unavailable', `${what}: executor failure: ${(out.stderr || out.stdout).slice(0, 300)}`, true);
+  }
+}
+
 class JobError extends Error {
   constructor(code, message, retryable) {
     super(message);
@@ -179,6 +194,7 @@ const OPERATIONS = {
 
     const info = await qtmesh(['info', input, '--json'], ctx);
     if (info.timedOut) throw new JobError('processor_timeout', 'qtmesh info timed out', true);
+    ensureExecutorOk(info, 'qtmesh info');
     if (info.code !== 0) throw new JobError('invalid_asset', `qtmesh info failed: ${info.stderr.slice(0, 300)}`, false);
     try { report.info = JSON.parse(info.stdout); } catch { report.info = null; }
 
@@ -209,6 +225,7 @@ const OPERATIONS = {
       ? job.params.size : '512x512';
     const out = await qtmesh(['turntable', input, '-o', '{OUT}/thumbnail.png', '--frames', '1', '--size', size], ctx);
     if (out.timedOut) throw new JobError('processor_timeout', 'turntable timed out', true);
+    ensureExecutorOk(out, 'turntable');
     if (out.code !== 0) throw new JobError('render_failed', `turntable failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
     const thumbPath = path.join(ctx.outDir, 'thumbnail.png');
     if (!existsSync(thumbPath)) throw new JobError('render_failed', 'turntable produced no output', false);
@@ -289,6 +306,7 @@ async function processJob(claim) {
     } catch (e) {
       log('fail report rejected (lease lost?)', { jobId: job.id, error: String(e.message) });
     }
+    if (code === 'executor_unavailable') executorBroken = true;
     return false;
   } finally {
     clearInterval(renew);
@@ -298,12 +316,40 @@ async function processJob(claim) {
 
 // ---- main loop ------------------------------------------------------------------
 
+let executorBroken = false;
+
+// Refuse to claim anything if the executor can't run — a broken executor must
+// never convert queued jobs into failures.
+async function preflightExecutor() {
+  if (cfg.nativeQtmesh) {
+    if (!existsSync(cfg.nativeQtmesh)) {
+      console.error(`QTMESH_NATIVE_QTMESH points to a missing binary: ${cfg.nativeQtmesh}`);
+      process.exit(1);
+    }
+    const probe = await runProcess(cfg.nativeQtmesh, ['--help'], { timeoutMs: 15000 });
+    if (probe.code === -1) {
+      console.error(`Native qtmesh is not executable: ${probe.stderr}`);
+      process.exit(1);
+    }
+    log('executor ok', { executor: `native:${cfg.nativeQtmesh}` });
+    return;
+  }
+  const probe = await runProcess('docker', ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 20000 });
+  if (probe.code !== 0) {
+    console.error('Docker executor unavailable (is the daemon running?). ' +
+      'Start Docker, or set QTMESH_NATIVE_QTMESH to a native qtmesh binary.\n' + (probe.stderr || probe.stdout));
+    process.exit(1);
+  }
+  log('executor ok', { executor: `docker:${cfg.dockerImage}`, dockerServer: probe.stdout.trim() });
+}
+
 async function mainLoop() {
   if (!cfg.apiUrl || !cfg.token) {
     console.error('QTMESH_API_URL and QTMESH_RUNNER_TOKEN are required');
     process.exit(1);
   }
   mkdirSync(cfg.workDir, { recursive: true });
+  await preflightExecutor();
   await register();
 
   const heartbeat = setInterval(async () => {
@@ -329,6 +375,11 @@ async function mainLoop() {
     }
     await processJob(claim);
     processed++;
+    if (executorBroken) {
+      log('executor became unavailable — stopping so jobs are not drained into retries', {});
+      clearInterval(heartbeat);
+      process.exit(2); // service supervisors restart us; jobs requeue via lease/retry
+    }
     if (cfg.maxJobs && processed >= cfg.maxJobs) break;
   }
 
