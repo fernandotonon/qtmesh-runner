@@ -230,6 +230,16 @@ const OPERATIONS = {
         .filter((a) => a && a.name)
         .slice(0, 100)
         .map((a) => ({ name: String(a.name).slice(0, 120), duration: typeof a.duration === 'number' ? Math.round(a.duration * 100) / 100 : null })),
+      // Full validation check list (error/warning/info/ok) so the site can
+      // show WHAT the issues are, not just that they exist.
+      validation: Array.isArray(report.validation)
+        ? report.validation.slice(0, 30).map((chk) => ({
+            type: String(chk && chk.type || 'info').slice(0, 12),
+            description: String(chk && chk.description || '').slice(0, 200),
+            count: typeof (chk && chk.count) === 'number' ? chk.count : null,
+            fixable: Boolean(chk && chk.fixable),
+          }))
+        : [],
       hasErrors: val.code !== 0,
     };
     return {
