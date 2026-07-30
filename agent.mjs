@@ -311,8 +311,27 @@ const OPERATIONS = {
     return renderSheet(job, ctx, 'turntable', { frames: 12, columns: 12 });
   },
 
+  // Sprite sheets use `qtmesh isometric` (rows = directions, cols = frames)
+  // — a different renderer from turntable. `animation` passes through when
+  // provided (currently gated in the UI by QtMeshEditor#936).
   async 'render-sprite-sheet'(job, ctx) {
-    return renderSheet(job, ctx, 'sprite-sheet', { frames: 16, columns: 4 });
+    const input = `{IN}/${ctx.inputName}`;
+    const p = job.params || {};
+    const directions = Math.min(8, Math.max(1, parseInt(p.directions, 10) || 8));
+    const frames = Math.min(36, Math.max(1, parseInt(p.frames, 10) || 1));
+    const size = typeof p.size === 'string' && /^\d{2,4}x\d{2,4}$/.test(p.size) ? p.size : '256x256';
+    const args = ['isometric', input, '-o', '{OUT}/sheet.png', '--directions', String(directions), '--frames', String(frames), '--size', size];
+    if (typeof p.animation === 'string' && p.animation) args.push('--animation', p.animation);
+    if (p.elevation !== undefined && !isNaN(Number(p.elevation))) args.push('--elevation', String(Number(p.elevation)));
+    const out = await qtmesh(args, ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'isometric timed out', true);
+    ensureExecutorOk(out, 'isometric');
+    if (out.code !== 0) throw new JobError('render_failed', `isometric failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const sheetPath = path.join(ctx.outDir, 'sheet.png');
+    if (!existsSync(sheetPath)) throw new JobError('render_failed', 'isometric produced no output', false);
+    const metaPath = path.join(ctx.outDir, 'sprite-metadata.json');
+    writeFileSync(metaPath, JSON.stringify({ directions, frames, animation: p.animation || null, frameSize: size, layout: 'rows=directions, cols=frames' }, null, 2));
+    return { artifacts: { 'sprite-sheet': sheetPath, 'sprite-metadata': metaPath }, result: { directions, frames, animation: p.animation || null, size } };
   },
 };
 
