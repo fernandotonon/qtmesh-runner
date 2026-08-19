@@ -333,6 +333,44 @@ const OPERATIONS = {
     writeFileSync(metaPath, JSON.stringify({ directions, frames, animation: p.animation || null, frameSize: size, layout: 'rows=directions, cols=frames' }, null, 2));
     return { artifacts: { 'sprite-sheet': sheetPath, 'sprite-metadata': metaPath }, result: { directions, frames, animation: p.animation || null, size } };
   },
+
+  // Auto-rig a static mesh (qtmesh rig, UniRig backend). Optional --skin to
+  // also compute weights in the same pass. ONNX inference is slow (~tens of s).
+  async 'auto-rig'(job, ctx) {
+    const input = `{IN}/${ctx.inputName}`;
+    const p = job.params || {};
+    // Always output GLB: it carries the skeleton (and skin weights) — OBJ/STL
+    // cannot, so a rig written back to the input format would silently drop it.
+    const skeleton = ['humanoid', 'biped', 'quadruped', 'generic'].includes(String(p.skeleton)) ? String(p.skeleton) : 'humanoid';
+    const algo = ['unirig', 'pinocchio'].includes(String(p.algo)) ? String(p.algo) : 'unirig';
+    const args = ['rig', input, '--skeleton', skeleton, '--algo', algo, '-o', '{OUT}/rigged.glb'];
+    if (p.skin === true) args.push('--skin');
+    const out = await qtmesh(args, ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh rig timed out', true);
+    ensureExecutorOk(out, 'qtmesh rig');
+    if (out.code !== 0) throw new JobError('invalid_asset', `rig failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const riggedPath = path.join(ctx.outDir, 'rigged.glb');
+    if (!existsSync(riggedPath)) throw new JobError('invalid_asset', 'rig produced no output', false);
+    return { artifacts: { 'rigged-model': riggedPath }, result: { skeleton, algo, skinned: p.skin === true, summary: out.stdout.slice(0, 500) } };
+  },
+
+  // Compute skin weights on a rigged mesh (qtmesh skin, SkinTokens ML backend;
+  // falls back to geodesic-voxel if the ~2.3 GB models aren't available).
+  // Outputs GLB so the skeleton + computed weights survive.
+  async 'skin-model'(job, ctx) {
+    const input = `{IN}/${ctx.inputName}`;
+    const p = job.params || {};
+    const algo = ['skintokens', 'geodesic-voxel', 'inverse-distance'].includes(String(p.algo)) ? String(p.algo) : 'skintokens';
+    const args = ['skin', input, '--algo', algo, '-o', '{OUT}/skinned.glb'];
+    if (p.maxInfluences !== undefined && Number.isInteger(Number(p.maxInfluences))) args.push('--max-influences', String(Number(p.maxInfluences)));
+    const out = await qtmesh(args, ctx);
+    if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh skin timed out', true);
+    ensureExecutorOk(out, 'qtmesh skin');
+    if (out.code !== 0) throw new JobError('invalid_asset', `skin failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
+    const skinnedPath = path.join(ctx.outDir, 'skinned.glb');
+    if (!existsSync(skinnedPath)) throw new JobError('invalid_asset', 'skin produced no output', false);
+    return { artifacts: { 'skinned-model': skinnedPath }, result: { algo, summary: out.stdout.slice(0, 500) } };
+  },
 };
 
 // Shared turntable-based sheet renderer for render-turntable / render-sprite-sheet.
