@@ -115,6 +115,43 @@ Stop/remove: `launchctl bootout gui/$(id -u)/com.qtmesh.runner`.
 | `QTMESH_MAX_LOAD` | cpu cores | pause claiming above this 1-min load average |
 | `QTMESH_MIN_FREE_GB` | 5 | pause claiming below this free disk space |
 | `QTMESH_PAUSE_FILE` | `~/.qtmesh-runner/paused` | `touch` it to pause, delete to resume |
+| `QTMESH_MODEL_CACHE_DIR` | `~/.qtmesh-runner/ai-models` | persistent ONNX cache for the ML backends; empty disables the mount |
+
+
+### ML model weights (auto-rig / skinning)
+
+`auto-rig --algo unirig` and `skin-model --algo skintokens` are ONNX models whose
+weights are **not** baked into the processor image; upstream downloads them on
+first use. Jobs run with `--network=none`, so they cannot be fetched at job time.
+
+When the weights are missing these backends **do not fail** — they silently fall
+back to the deterministic template rig (`pinocchio` / `geodesic-voxel`) and still
+exit 0. Warm the cache once, out of band:
+
+```bash
+node agent.mjs warm-models                    # both sets (~3.7 GB total)
+node agent.mjs warm-models --set unirig       # auto-rig only  (~1.4 GB)
+node agent.mjs warm-models --set skintokens   # skinning only  (~2.3 GB)
+```
+
+Downloads verify `Content-Length`, write via a `.part` rename, and resume from
+the partial offset if interrupted, so a truncated file is never mistaken for a
+complete model. Re-running is idempotent — already-cached files are skipped.
+
+With the Docker executor the cache is bind-mounted into each container. With
+`QTMESH_NATIVE_QTMESH` there is nothing to mount, so `warm-models` also wires the
+native binary to the same cache: on Linux the agent points `XDG_DATA_HOME` at it
+when spawning `qtmesh`, and on macOS it symlinks the cache into
+`~/Library/Application Support/QtMeshEditor/QtMeshEditor/ai_models`. Run
+`warm-models` with the same `QTMESH_NATIVE_QTMESH`/`QTMESH_MODEL_CACHE_DIR` values
+the runner itself uses. If that path already exists as a real directory it is
+left untouched and a warning is printed — point `QTMESH_MODEL_CACHE_DIR` at it
+instead.
+
+The cache is bind-mounted read-write into each container, so it persists across
+`--rm` runs. The runner reports the algorithm that *actually* ran in
+`result.algo` (with `fallback: true` and `fallbackReason` when it degraded), so a
+template rig is never reported as an ML rig.
 
 ## How it works
 

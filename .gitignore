@@ -1,0 +1,7 @@
+node_modules/
+
+# Runner env files hold a live QTMESH_RUNNER_TOKEN — never commit them.
+# The committed template is examples/qtmesh-runner.env.example.
+qtmesh-runner.env
+*.env
+!examples/*.env.example

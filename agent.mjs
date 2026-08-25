@@ -23,7 +23,7 @@
 //   QTMESH_EPHEMERAL        "1" for CI workers
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync, statfsSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync, statfsSync, renameSync, lstatSync, readlinkSync, symlinkSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -50,6 +50,13 @@ const cfg = {
   nativeQtmesh: process.env.QTMESH_NATIVE_QTMESH || '',
   dockerImage: process.env.QTMESH_DOCKER_IMAGE || 'ghcr.io/fernandotonon/qtmesh:latest',
   jobTimeoutMs: Math.max(10, Number(process.env.QTMESH_JOB_TIMEOUT || 600)) * 1000,
+  // Persistent host dir for the ~1.4 GB ONNX model cache (UniRig, SkinTokens).
+  // Containers are --rm, so without this every ML job re-downloads the models --
+  // and under --network=none it cannot download them at all and silently falls
+  // back to the deterministic template backend. Set to '' to disable the mount.
+  modelCacheDir: process.env.QTMESH_MODEL_CACHE_DIR !== undefined
+    ? process.env.QTMESH_MODEL_CACHE_DIR
+    : path.join(os.homedir(), '.qtmesh-runner', 'ai-models'),
   ephemeral: process.env.QTMESH_EPHEMERAL === '1' || flag('--ephemeral'),
   continuous: flag('--continuous'),
   exitWhenEmpty: flag('--exit-when-empty'),
@@ -119,9 +126,9 @@ async function register() {
 
 // ---- executor -----------------------------------------------------------------
 
-function runProcess(cmd, args, { timeoutMs, onSpawn } = {}) {
+function runProcess(cmd, args, { timeoutMs, onSpawn, env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env } : {}) });
     if (onSpawn) onSpawn(child);
     let stdout = '';
     let stderr = '';
@@ -142,12 +149,54 @@ function runProcess(cmd, args, { timeoutMs, onSpawn } = {}) {
   });
 }
 
+// The image runs as uid 10001 with HOME=/home/qtmesh; qtmesh resolves its model
+// cache via Qt's writable AppDataLocation, i.e. $HOME/.local/share/<org>/<app>.
+const CONTAINER_HOME = '/home/qtmesh';
+const MODEL_CACHE_SUBPATH = '.local/share/QtMeshEditor/QtMeshEditor/ai_models';
+
+// The native executor cannot be bind-mounted, so point Qt's AppDataLocation at
+// the warmed cache instead. Qt honours XDG_DATA_HOME on Linux; macOS resolves
+// AppDataLocation under ~/Library/Application Support and ignores it, so there
+// we symlink the app's ai_models dir at warm time (see linkNativeCache).
+function nativeModelEnv() {
+  if (!cfg.modelCacheDir || process.platform === 'darwin') return undefined;
+  // Qt appends <org>/<app>/ under XDG_DATA_HOME, so hand it a private root whose
+  // QtMeshEditor/QtMeshEditor/ai_models path is the warmed cache. Built by
+  // warm-models via linkNativeCache(); see nativeXdgRoot().
+  return { ...process.env, XDG_DATA_HOME: nativeXdgRoot() };
+}
+
+// Private XDG root whose <org>/<app>/ai_models resolves to cfg.modelCacheDir.
+function nativeXdgRoot() {
+  return path.join(cfg.modelCacheDir, '.xdg');
+}
+
+// Where the native binary looks for its models by default (Qt AppDataLocation).
+function nativeCacheDir() {
+  const root = process.platform === 'darwin'
+    ? path.join(os.homedir(), 'Library', 'Application Support')
+    : path.join(os.homedir(), '.local', 'share');
+  return path.join(root, 'QtMeshEditor', 'QtMeshEditor', 'ai_models');
+}
+
+// Bind the host model cache over the container's ai_models dir so ONNX weights
+// persist across --rm containers and stay usable under --network=none.
+function modelCacheArgs() {
+  if (!cfg.modelCacheDir) return [];
+  try {
+    mkdirSync(cfg.modelCacheDir, { recursive: true });
+  } catch {
+    return [];
+  }
+  return ['--mount', `type=bind,src=${cfg.modelCacheDir},dst=${CONTAINER_HOME}/${MODEL_CACHE_SUBPATH}`];
+}
+
 // Execute `qtmesh <args>` natively or in a locked-down container. Paths inside
 // `args` must use {IN}/{OUT} placeholders so the docker path can remap them.
 async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
   if (cfg.nativeQtmesh) {
     const mapped = args.map((a) => a.replaceAll('{IN}', inDir).replaceAll('{OUT}', outDir));
-    return runProcess(cfg.nativeQtmesh, mapped, { timeoutMs, onSpawn });
+    return runProcess(cfg.nativeQtmesh, mapped, { timeoutMs, onSpawn, env: nativeModelEnv() });
   }
   const mapped = args.map((a) => a.replaceAll('{IN}', '/input').replaceAll('{OUT}', '/output'));
   return runProcess('docker', [
@@ -156,6 +205,7 @@ async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
     '--memory=4g', '--cpus=2', '--pids-limit=256',
     '--mount', `type=bind,src=${inDir},dst=/input,readonly`,
     '--mount', `type=bind,src=${outDir},dst=/output`,
+    ...modelCacheArgs(),
     cfg.dockerImage, ...mapped,
   ], { timeoutMs, onSpawn });
 }
@@ -170,13 +220,27 @@ async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
 function isExecutorFailure(out) {
   const hay = `${out.stderr || ''}\n${out.stdout || ''}`;
   return out.code === -1 ||
-    /docker API|Docker daemon|docker\.sock|Cannot connect to the Docker|command not found|No such file or directory: .*docker|ENOENT/i.test(hay);
+    /docker API|Docker daemon|docker\.sock|Cannot connect to the Docker|command not found|No such file or directory: .*docker|ENOENT/i.test(hay) ||
+    // A stale executor image that predates an operation reports the subcommand
+    // as unknown. The asset is fine — the runner is out of date — so this is a
+    // retryable environment fault, never a permanent invalid_asset.
+    /Unknown command|unrecognized (?:command|subcommand)|no such command/i.test(hay);
 }
 
 function ensureExecutorOk(out, what) {
   if (isExecutorFailure(out)) {
     throw new JobError('executor_unavailable', `${what}: executor failure: ${(out.stderr || out.stdout).slice(0, 300)}`, true);
   }
+}
+
+// qtmesh --json prints a single JSON object, sometimes preceded by human-readable
+// "Note:" lines on stdout. Take the outermost {...} span.
+function parseJsonReport(stdout) {
+  const text = String(stdout || '');
+  const a = text.indexOf('{');
+  const b = text.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  try { return JSON.parse(text.slice(a, b + 1)); } catch { return null; }
 }
 
 class JobError extends Error {
@@ -186,6 +250,10 @@ class JobError extends Error {
     this.retryable = retryable;
   }
 }
+
+// qtmesh subcommands the operation adapters rely on, checked against the
+// executor's --help at startup.
+const OPERATION_COMMANDS = ['info', 'validate', 'anim', 'fix', 'convert', 'lod', 'turntable', 'isometric', 'rig', 'skin'];
 
 const OPERATIONS = {
   async 'analyze-asset'(job, ctx) {
@@ -343,7 +411,7 @@ const OPERATIONS = {
     // cannot, so a rig written back to the input format would silently drop it.
     const skeleton = ['humanoid', 'biped', 'quadruped', 'generic'].includes(String(p.skeleton)) ? String(p.skeleton) : 'humanoid';
     const algo = ['unirig', 'pinocchio'].includes(String(p.algo)) ? String(p.algo) : 'unirig';
-    const args = ['rig', input, '--skeleton', skeleton, '--algo', algo, '-o', '{OUT}/rigged.glb'];
+    const args = ['rig', input, '--skeleton', skeleton, '--algo', algo, '--json', '-o', '{OUT}/rigged.glb'];
     if (p.skin === true) args.push('--skin');
     const out = await qtmesh(args, ctx);
     if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh rig timed out', true);
@@ -351,7 +419,23 @@ const OPERATIONS = {
     if (out.code !== 0) throw new JobError('invalid_asset', `rig failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
     const riggedPath = path.join(ctx.outDir, 'rigged.glb');
     if (!existsSync(riggedPath)) throw new JobError('invalid_asset', 'rig produced no output', false);
-    return { artifacts: { 'rigged-model': riggedPath }, result: { skeleton, algo, skinned: p.skin === true, summary: out.stdout.slice(0, 500) } };
+    // `--algo unirig` silently degrades to the deterministic template backend
+    // when the ONNX weights are missing, still exiting 0. Report the algorithm
+    // that actually ran (never the requested one) so a template rig is never
+    // passed off as an ML rig, and surface the reason.
+    const report = parseJsonReport(out.stdout);
+    const algoUsed = typeof report?.algorithm === 'string' ? report.algorithm : algo;
+    const fallbackReason = typeof report?.fallbackReason === 'string' ? report.fallbackReason : null;
+    if (fallbackReason) log('rig backend fell back', { jobId: job.id, requested: algo, used: algoUsed, reason: fallbackReason });
+    return {
+      artifacts: { 'rigged-model': riggedPath },
+      result: {
+        skeleton, algo: algoUsed, algoRequested: algo, skinned: p.skin === true,
+        ...(fallbackReason ? { fallback: true, fallbackReason } : {}),
+        ...(Number.isFinite(report?.boneCount) ? { boneCount: report.boneCount } : {}),
+        summary: out.stdout.slice(0, 500),
+      },
+    };
   },
 
   // Compute skin weights on a rigged mesh (qtmesh skin, SkinTokens ML backend;
@@ -361,7 +445,7 @@ const OPERATIONS = {
     const input = `{IN}/${ctx.inputName}`;
     const p = job.params || {};
     const algo = ['skintokens', 'geodesic-voxel', 'inverse-distance'].includes(String(p.algo)) ? String(p.algo) : 'skintokens';
-    const args = ['skin', input, '--algo', algo, '-o', '{OUT}/skinned.glb'];
+    const args = ['skin', input, '--algo', algo, '--json', '-o', '{OUT}/skinned.glb'];
     if (p.maxInfluences !== undefined && Number.isInteger(Number(p.maxInfluences))) args.push('--max-influences', String(Number(p.maxInfluences)));
     const out = await qtmesh(args, ctx);
     if (out.timedOut) throw new JobError('processor_timeout', 'qtmesh skin timed out', true);
@@ -369,7 +453,23 @@ const OPERATIONS = {
     if (out.code !== 0) throw new JobError('invalid_asset', `skin failed: ${(out.stderr || out.stdout).slice(0, 300)}`, false);
     const skinnedPath = path.join(ctx.outDir, 'skinned.glb');
     if (!existsSync(skinnedPath)) throw new JobError('invalid_asset', 'skin produced no output', false);
-    return { artifacts: { 'skinned-model': skinnedPath }, result: { algo, summary: out.stdout.slice(0, 500) } };
+    // Same silent-degradation contract as auto-rig: 'skintokens' falls back to
+    // geodesic-voxel when the ~2.3 GB models are unavailable, still exiting 0.
+    // NB: `skin --json` names the field `algorithmUsed`, while `rig` uses
+    // `algorithm`; accept either so a fallback is never missed.
+    const report = parseJsonReport(out.stdout);
+    const algoUsed = typeof report?.algorithmUsed === 'string' ? report.algorithmUsed
+      : typeof report?.algorithm === 'string' ? report.algorithm : algo;
+    const fallbackReason = typeof report?.fallbackReason === 'string' ? report.fallbackReason : null;
+    if (fallbackReason) log('skin backend fell back', { jobId: job.id, requested: algo, used: algoUsed, reason: fallbackReason });
+    return {
+      artifacts: { 'skinned-model': skinnedPath },
+      result: {
+        algo: algoUsed, algoRequested: algo,
+        ...(fallbackReason ? { fallback: true, fallbackReason } : {}),
+        summary: out.stdout.slice(0, 500),
+      },
+    };
   },
 };
 
@@ -524,7 +624,7 @@ async function preflightExecutor() {
       console.error(`Native qtmesh is not executable: ${probe.stderr}`);
       process.exit(1);
     }
-    log('executor ok', { executor: `native:${cfg.nativeQtmesh}` });
+    log('executor ok', { executor: `native:${cfg.nativeQtmesh}`, ...(await executorVersion()) });
     return;
   }
   const probe = await runProcess('docker', ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: 20000 });
@@ -533,7 +633,34 @@ async function preflightExecutor() {
       'Start Docker, or set QTMESH_NATIVE_QTMESH to a native qtmesh binary.\n' + (probe.stderr || probe.stdout));
     process.exit(1);
   }
-  log('executor ok', { executor: `docker:${cfg.dockerImage}`, dockerServer: probe.stdout.trim() });
+  log('executor ok', {
+    executor: `docker:${cfg.dockerImage}`,
+    dockerServer: probe.stdout.trim(),
+    ...(await executorVersion()),
+  });
+}
+
+// Report the qtmesh build the executor actually runs, plus the operations it
+// supports. A stale image silently lacks newer subcommands (e.g. `rig`), so
+// surfacing this at startup makes "runner needs a docker pull" obvious instead
+// of only showing up as a mid-job failure.
+async function executorVersion() {
+  const run = (args) => cfg.nativeQtmesh
+    ? runProcess(cfg.nativeQtmesh, args, { timeoutMs: 30000 })
+    : runProcess('docker', ['run', '--rm', '--network=none', cfg.dockerImage, ...args], { timeoutMs: 60000 });
+  try {
+    const [ver, help] = await Promise.all([run(['--version']), run(['--help'])]);
+    const qtmeshVersion = (ver.stdout || '').trim().split('\n')[0] || null;
+    const hay = `${help.stdout || ''}\n${help.stderr || ''}`;
+    const missing = OPERATION_COMMANDS.filter((c) => !new RegExp(`^\\s+${c}\\s`, 'm').test(hay));
+    if (missing.length) {
+      console.error(`WARNING: executor is missing subcommands: ${missing.join(', ')}. ` +
+        (cfg.nativeQtmesh ? 'Update the native qtmesh binary.' : `Run: docker pull ${cfg.dockerImage}`));
+    }
+    return { qtmeshVersion, ...(missing.length ? { missingCommands: missing } : {}) };
+  } catch {
+    return {};
+  }
 }
 
 async function mainLoop() {
@@ -592,14 +719,152 @@ async function mainLoop() {
 
 // ---- entry ----------------------------------------------------------------------
 
+// Pre-download the ONNX weights into the persistent model cache. Jobs run with
+// --network=none, so the models can only be fetched here, out of band. Verifies
+// Content-Length and writes via a .part rename so a truncated download can never
+// masquerade as a complete model.
+// Multi-GB transfers get dropped; resume rather than restart.
+const MODEL_FETCH_RETRIES = Math.max(1, Number(process.env.QTMESH_MODEL_FETCH_RETRIES || 5));
+
+const MODEL_SETS = {
+  unirig: {
+    baseUrl: process.env.QTMESH_UNIRIG_MODEL_BASE_URL ||
+      'https://huggingface.co/fernandotonon/QtMeshEditor-models/resolve/main/unirig/',
+    files: ['embed.onnx', 'encoder.onnx', 'decoder.onnx'],
+  },
+  // ~2.3 GB. decoder.onnx is a 1.4 MB graph whose weights live in the external
+  // decoder.onnx.data sidecar — both are required or the backend won't load.
+  skintokens: {
+    baseUrl: process.env.QTMESH_SKINTOKENS_MODEL_BASE_URL ||
+      'https://huggingface.co/fernandotonon/QtMeshEditor-models/resolve/main/skintokens/',
+    files: [
+      'skintokens.json', 'embed.onnx', 'mesh_cond.onnx', 'vae_cond.onnx',
+      'skin_decode.onnx', 'decoder.onnx', 'decoder.onnx.data',
+    ],
+  },
+};
+
+// The native executor reads Qt's AppDataLocation directly. On Linux we can
+// redirect it with XDG_DATA_HOME at spawn time; macOS ignores that, so link the
+// warmed cache into place instead. Never clobber a real directory that already
+// holds models -- only create the link, or replace a link we own.
+function linkNativeCache() {
+  const target = process.platform === 'darwin'
+    ? nativeCacheDir()
+    : path.join(nativeXdgRoot(), 'QtMeshEditor', 'QtMeshEditor', 'ai_models');
+  try {
+    const existing = lstatSync(target, { throwIfNoEntry: false });
+    if (existing?.isSymbolicLink()) {
+      if (readlinkSync(target) === cfg.modelCacheDir) return;
+      rmSync(target, { force: true });
+    } else if (existing) {
+      console.error(`Native model cache ${target} already exists and is not a symlink. ` +
+        `Point QTMESH_MODEL_CACHE_DIR at it, or move it aside, so warmed models are actually used.`);
+      return;
+    }
+    mkdirSync(path.dirname(target), { recursive: true });
+    symlinkSync(cfg.modelCacheDir, target, 'dir');
+    log('native model cache linked', { from: target, to: cfg.modelCacheDir });
+  } catch (err) {
+    console.error(`Could not link the native model cache (${target}): ${err.message}`);
+  }
+}
+
+async function warmModels() {
+  if (!cfg.modelCacheDir) {
+    console.error('QTMESH_MODEL_CACHE_DIR is empty — nothing to warm.');
+    process.exit(1);
+  }
+  const only = flagValue('--set', '');
+  const sets = only ? [only] : Object.keys(MODEL_SETS);
+  let failed = 0;
+  for (const name of sets) {
+    const set = MODEL_SETS[name];
+    if (!set) { console.error(`Unknown model set: ${name}`); failed++; continue; }
+    const dir = path.join(cfg.modelCacheDir, name);
+    mkdirSync(dir, { recursive: true });
+    for (const file of set.files) {
+      const dest = path.join(dir, file);
+      const url = new URL(file, set.baseUrl).toString();
+      try {
+        const head = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+        const expected = Number(head.headers.get('content-length')) || 0;
+        if (!head.ok) throw new Error(`HTTP ${head.status}`);
+        // Some assets are served without a Content-Length (chunked); for those
+        // a non-empty cached file is the best signal we have.
+        if (existsSync(dest) && (expected ? statSync(dest).size === expected : statSync(dest).size > 0)) {
+          log('model cached', { set: name, file, bytes: statSync(dest).size });
+          continue;
+        }
+        log('model downloading', { set: name, file, bytes: expected || null });
+        const tmp = `${dest}.part`;
+        // These are multi-GB transfers; a dropped connection is normal, not
+        // exceptional. Resume from the .part offset with a Range request
+        // instead of restarting from zero.
+        //
+        // A leftover .part that is at least as large as the upstream file
+        // cannot be a valid prefix of it (upstream was replaced by a smaller
+        // build). Resuming from that offset would request past EOF and get 416
+        // forever, so the cache could never self-heal -- discard it and restart.
+        if (expected && existsSync(tmp) && statSync(tmp).size >= expected) {
+          log('model discarding stale partial', { set: name, file, bytes: statSync(tmp).size, expected });
+          rmSync(tmp, { force: true });
+        }
+        try {
+          let attempt = 0;
+          for (;;) {
+            attempt++;
+            const have = existsSync(tmp) ? statSync(tmp).size : 0;
+            if (expected && have === expected) break;
+            try {
+              const headers = have > 0 ? { Range: `bytes=${have}-` } : {};
+              const res = await fetch(url, { redirect: 'follow', headers });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              // A server that ignores Range replies 200 and restarts the stream.
+              const append = have > 0 && res.status === 206;
+              await pipeline(res.body, createWriteStream(tmp, append ? { flags: 'a' } : {}));
+            } catch (err) {
+              if (attempt >= MODEL_FETCH_RETRIES) throw err;
+              log('model download interrupted, resuming', { set: name, file, attempt, bytes: existsSync(tmp) ? statSync(tmp).size : 0 });
+              continue;
+            }
+            const size = statSync(tmp).size;
+            if (!expected || size === expected) break;
+            if (attempt >= MODEL_FETCH_RETRIES) throw new Error(`size mismatch: got ${size}, expected ${expected}`);
+          }
+          const got = statSync(tmp).size;
+          if (expected && got !== expected) throw new Error(`size mismatch: got ${got}, expected ${expected}`);
+          renameSync(tmp, dest);
+          log('model ready', { set: name, file, bytes: got });
+        } catch (err) {
+          // Never leave a partial that later runs would resume from blindly.
+          if (existsSync(tmp) && (!expected || statSync(tmp).size >= expected)) rmSync(tmp, { force: true });
+          throw err;
+        }
+      } catch (err) {
+        console.error(`FAILED ${name}/${file}: ${err.message}`);
+        failed++;
+      }
+    }
+  }
+  if (failed) {
+    console.error(`${failed} model file(s) failed. ML backends will fall back to the deterministic template.`);
+    process.exit(1);
+  }
+  if (cfg.nativeQtmesh) linkNativeCache();
+  log('models warm', { cacheDir: cfg.modelCacheDir, sets });
+}
+
 if (command === 'capabilities') {
   console.log(JSON.stringify({ name: cfg.name, platform: process.platform, arch: process.arch, capabilities: detectCapabilities() }, null, 2));
 } else if (command === 'health') {
   const executor = cfg.nativeQtmesh ? `native:${cfg.nativeQtmesh}` : `docker:${cfg.dockerImage}`;
   console.log(JSON.stringify({ ok: Boolean(cfg.apiUrl && cfg.token), apiUrl: cfg.apiUrl, executor }, null, 2));
+} else if (command === 'warm-models') {
+  warmModels().catch((err) => { console.error(err); process.exit(1); });
 } else if (command === 'run') {
   mainLoop().catch((err) => { console.error(err); process.exit(1); });
 } else {
-  console.error(`Unknown command: ${command}. Use: run | capabilities | health`);
+  console.error(`Unknown command: ${command}. Use: run | capabilities | health | warm-models`);
   process.exit(1);
 }
