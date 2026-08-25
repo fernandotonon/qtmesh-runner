@@ -23,7 +23,7 @@
 //   QTMESH_EPHEMERAL        "1" for CI workers
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync, statfsSync, renameSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, createWriteStream, existsSync, statSync, readdirSync, statfsSync, renameSync, lstatSync, readlinkSync, symlinkSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -126,9 +126,9 @@ async function register() {
 
 // ---- executor -----------------------------------------------------------------
 
-function runProcess(cmd, args, { timeoutMs, onSpawn } = {}) {
+function runProcess(cmd, args, { timeoutMs, onSpawn, env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env } : {}) });
     if (onSpawn) onSpawn(child);
     let stdout = '';
     let stderr = '';
@@ -154,6 +154,31 @@ function runProcess(cmd, args, { timeoutMs, onSpawn } = {}) {
 const CONTAINER_HOME = '/home/qtmesh';
 const MODEL_CACHE_SUBPATH = '.local/share/QtMeshEditor/QtMeshEditor/ai_models';
 
+// The native executor cannot be bind-mounted, so point Qt's AppDataLocation at
+// the warmed cache instead. Qt honours XDG_DATA_HOME on Linux; macOS resolves
+// AppDataLocation under ~/Library/Application Support and ignores it, so there
+// we symlink the app's ai_models dir at warm time (see linkNativeCache).
+function nativeModelEnv() {
+  if (!cfg.modelCacheDir || process.platform === 'darwin') return undefined;
+  // Qt appends <org>/<app>/ under XDG_DATA_HOME, so hand it a private root whose
+  // QtMeshEditor/QtMeshEditor/ai_models path is the warmed cache. Built by
+  // warm-models via linkNativeCache(); see nativeXdgRoot().
+  return { ...process.env, XDG_DATA_HOME: nativeXdgRoot() };
+}
+
+// Private XDG root whose <org>/<app>/ai_models resolves to cfg.modelCacheDir.
+function nativeXdgRoot() {
+  return path.join(cfg.modelCacheDir, '.xdg');
+}
+
+// Where the native binary looks for its models by default (Qt AppDataLocation).
+function nativeCacheDir() {
+  const root = process.platform === 'darwin'
+    ? path.join(os.homedir(), 'Library', 'Application Support')
+    : path.join(os.homedir(), '.local', 'share');
+  return path.join(root, 'QtMeshEditor', 'QtMeshEditor', 'ai_models');
+}
+
 // Bind the host model cache over the container's ai_models dir so ONNX weights
 // persist across --rm containers and stay usable under --network=none.
 function modelCacheArgs() {
@@ -171,7 +196,7 @@ function modelCacheArgs() {
 async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
   if (cfg.nativeQtmesh) {
     const mapped = args.map((a) => a.replaceAll('{IN}', inDir).replaceAll('{OUT}', outDir));
-    return runProcess(cfg.nativeQtmesh, mapped, { timeoutMs, onSpawn });
+    return runProcess(cfg.nativeQtmesh, mapped, { timeoutMs, onSpawn, env: nativeModelEnv() });
   }
   const mapped = args.map((a) => a.replaceAll('{IN}', '/input').replaceAll('{OUT}', '/output'));
   return runProcess('docker', [
@@ -719,6 +744,32 @@ const MODEL_SETS = {
   },
 };
 
+// The native executor reads Qt's AppDataLocation directly. On Linux we can
+// redirect it with XDG_DATA_HOME at spawn time; macOS ignores that, so link the
+// warmed cache into place instead. Never clobber a real directory that already
+// holds models -- only create the link, or replace a link we own.
+function linkNativeCache() {
+  const target = process.platform === 'darwin'
+    ? nativeCacheDir()
+    : path.join(nativeXdgRoot(), 'QtMeshEditor', 'QtMeshEditor', 'ai_models');
+  try {
+    const existing = lstatSync(target, { throwIfNoEntry: false });
+    if (existing?.isSymbolicLink()) {
+      if (readlinkSync(target) === cfg.modelCacheDir) return;
+      rmSync(target, { force: true });
+    } else if (existing) {
+      console.error(`Native model cache ${target} already exists and is not a symlink. ` +
+        `Point QTMESH_MODEL_CACHE_DIR at it, or move it aside, so warmed models are actually used.`);
+      return;
+    }
+    mkdirSync(path.dirname(target), { recursive: true });
+    symlinkSync(cfg.modelCacheDir, target, 'dir');
+    log('native model cache linked', { from: target, to: cfg.modelCacheDir });
+  } catch (err) {
+    console.error(`Could not link the native model cache (${target}): ${err.message}`);
+  }
+}
+
 async function warmModels() {
   if (!cfg.modelCacheDir) {
     console.error('QTMESH_MODEL_CACHE_DIR is empty — nothing to warm.');
@@ -750,34 +801,46 @@ async function warmModels() {
         // These are multi-GB transfers; a dropped connection is normal, not
         // exceptional. Resume from the .part offset with a Range request
         // instead of restarting from zero.
-        let attempt = 0;
-        for (;;) {
-          attempt++;
-          const have = existsSync(tmp) ? statSync(tmp).size : 0;
-          if (expected && have === expected) break;
-          try {
-            const headers = have > 0 ? { Range: `bytes=${have}-` } : {};
-            const res = await fetch(url, { redirect: 'follow', headers });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            // A server that ignores Range replies 200 and restarts the stream.
-            const append = have > 0 && res.status === 206;
-            await pipeline(res.body, createWriteStream(tmp, append ? { flags: 'a' } : {}));
-          } catch (err) {
-            if (attempt >= MODEL_FETCH_RETRIES) throw err;
-            log('model download interrupted, resuming', { set: name, file, attempt, bytes: existsSync(tmp) ? statSync(tmp).size : 0 });
-            continue;
-          }
-          const size = statSync(tmp).size;
-          if (!expected || size === expected) break;
-          if (attempt >= MODEL_FETCH_RETRIES) throw new Error(`size mismatch: got ${size}, expected ${expected}`);
-        }
-        const got = statSync(tmp).size;
-        if (expected && got !== expected) {
+        //
+        // A leftover .part that is at least as large as the upstream file
+        // cannot be a valid prefix of it (upstream was replaced by a smaller
+        // build). Resuming from that offset would request past EOF and get 416
+        // forever, so the cache could never self-heal -- discard it and restart.
+        if (expected && existsSync(tmp) && statSync(tmp).size >= expected) {
+          log('model discarding stale partial', { set: name, file, bytes: statSync(tmp).size, expected });
           rmSync(tmp, { force: true });
-          throw new Error(`size mismatch: got ${got}, expected ${expected}`);
         }
-        renameSync(tmp, dest);
-        log('model ready', { set: name, file, bytes: got });
+        try {
+          let attempt = 0;
+          for (;;) {
+            attempt++;
+            const have = existsSync(tmp) ? statSync(tmp).size : 0;
+            if (expected && have === expected) break;
+            try {
+              const headers = have > 0 ? { Range: `bytes=${have}-` } : {};
+              const res = await fetch(url, { redirect: 'follow', headers });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              // A server that ignores Range replies 200 and restarts the stream.
+              const append = have > 0 && res.status === 206;
+              await pipeline(res.body, createWriteStream(tmp, append ? { flags: 'a' } : {}));
+            } catch (err) {
+              if (attempt >= MODEL_FETCH_RETRIES) throw err;
+              log('model download interrupted, resuming', { set: name, file, attempt, bytes: existsSync(tmp) ? statSync(tmp).size : 0 });
+              continue;
+            }
+            const size = statSync(tmp).size;
+            if (!expected || size === expected) break;
+            if (attempt >= MODEL_FETCH_RETRIES) throw new Error(`size mismatch: got ${size}, expected ${expected}`);
+          }
+          const got = statSync(tmp).size;
+          if (expected && got !== expected) throw new Error(`size mismatch: got ${got}, expected ${expected}`);
+          renameSync(tmp, dest);
+          log('model ready', { set: name, file, bytes: got });
+        } catch (err) {
+          // Never leave a partial that later runs would resume from blindly.
+          if (existsSync(tmp) && (!expected || statSync(tmp).size >= expected)) rmSync(tmp, { force: true });
+          throw err;
+        }
       } catch (err) {
         console.error(`FAILED ${name}/${file}: ${err.message}`);
         failed++;
@@ -788,6 +851,7 @@ async function warmModels() {
     console.error(`${failed} model file(s) failed. ML backends will fall back to the deterministic template.`);
     process.exit(1);
   }
+  if (cfg.nativeQtmesh) linkNativeCache();
   log('models warm', { cacheDir: cfg.modelCacheDir, sets });
 }
 

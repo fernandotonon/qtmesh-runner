@@ -129,14 +129,24 @@ back to the deterministic template rig (`pinocchio` / `geodesic-voxel`) and stil
 exit 0. Warm the cache once, out of band:
 
 ```bash
-qtmesh-runner warm-models                    # both sets (~3.7 GB total)
-qtmesh-runner warm-models --set unirig       # auto-rig only  (~1.4 GB)
-qtmesh-runner warm-models --set skintokens   # skinning only  (~2.3 GB)
+node agent.mjs warm-models                    # both sets (~3.7 GB total)
+node agent.mjs warm-models --set unirig       # auto-rig only  (~1.4 GB)
+node agent.mjs warm-models --set skintokens   # skinning only  (~2.3 GB)
 ```
 
 Downloads verify `Content-Length`, write via a `.part` rename, and resume from
 the partial offset if interrupted, so a truncated file is never mistaken for a
 complete model. Re-running is idempotent — already-cached files are skipped.
+
+With the Docker executor the cache is bind-mounted into each container. With
+`QTMESH_NATIVE_QTMESH` there is nothing to mount, so `warm-models` also wires the
+native binary to the same cache: on Linux the agent points `XDG_DATA_HOME` at it
+when spawning `qtmesh`, and on macOS it symlinks the cache into
+`~/Library/Application Support/QtMeshEditor/QtMeshEditor/ai_models`. Run
+`warm-models` with the same `QTMESH_NATIVE_QTMESH`/`QTMESH_MODEL_CACHE_DIR` values
+the runner itself uses. If that path already exists as a real directory it is
+left untouched and a warning is printed — point `QTMESH_MODEL_CACHE_DIR` at it
+instead.
 
 The cache is bind-mounted read-write into each container, so it persists across
 `--rm` runs. The runner reports the algorithm that *actually* ran in
