@@ -109,6 +109,7 @@ Stop/remove: `launchctl bootout gui/$(id -u)/com.qtmesh.runner`.
 | `QTMESH_POLL_INTERVAL` | 30 | seconds between empty claims |
 | `QTMESH_WORK_DIR` | os tmp | per-job scratch (wiped after each job) |
 | `QTMESH_JOB_TIMEOUT` | 600 | seconds per job |
+| `QTMESH_JOB_MEMORY` | ~2/3 of the Docker VM (4–12g) | container memory cap; ML rigging/skinning needs several GB |
 | `QTMESH_EPHEMERAL` | — | `1` for CI workers (also disables eligibility checks) |
 | `QTMESH_ELIGIBILITY` | on | `off` disables all eligibility gating |
 | `QTMESH_REQUIRE_AC` | `1` on macOS | pause claiming on battery power |

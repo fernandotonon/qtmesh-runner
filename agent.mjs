@@ -50,6 +50,11 @@ const cfg = {
   nativeQtmesh: process.env.QTMESH_NATIVE_QTMESH || '',
   dockerImage: process.env.QTMESH_DOCKER_IMAGE || 'ghcr.io/fernandotonon/qtmesh:latest',
   jobTimeoutMs: Math.max(10, Number(process.env.QTMESH_JOB_TIMEOUT || 600)) * 1000,
+  // Memory cap for the processor container. The ML backends load multi-GB ONNX
+  // graphs (UniRig decoder alone is 1.2 GB), so the old fixed 4g cap OOM-killed
+  // them on real assets. Resolved at preflight from what the Docker VM actually
+  // has (see resolveJobMemory); this is only the explicit override.
+  jobMemory: process.env.QTMESH_JOB_MEMORY || '',
   // Persistent host dir for the ~1.4 GB ONNX model cache (UniRig, SkinTokens).
   // Containers are --rm, so without this every ML job re-downloads the models --
   // and under --network=none it cannot download them at all and silently falls
@@ -179,6 +184,22 @@ function nativeCacheDir() {
   return path.join(root, 'QtMeshEditor', 'QtMeshEditor', 'ai_models');
 }
 
+// Container memory cap. ML inference needs several GB, but the cap must also
+// fit inside the Docker VM or the daemon refuses the run. Preflight replaces
+// this with ~2/3 of the VM's memory (clamped to 4-12g); the 4g floor matches
+// the pre-ML default so non-ML operations behave as before on tiny machines.
+let DEFAULT_JOB_MEMORY = '4g';
+
+async function resolveJobMemory() {
+  if (cfg.jobMemory) return cfg.jobMemory;
+  const probe = await runProcess('docker', ['info', '--format', '{{.MemTotal}}'], { timeoutMs: 20000 });
+  const total = Number(probe.stdout.trim());
+  if (!Number.isFinite(total) || total <= 0) return DEFAULT_JOB_MEMORY;
+  const gb = Math.floor((total / 1073741824) * 2 / 3);
+  DEFAULT_JOB_MEMORY = `${Math.max(4, Math.min(12, gb))}g`;
+  return DEFAULT_JOB_MEMORY;
+}
+
 // Bind the host model cache over the container's ai_models dir so ONNX weights
 // persist across --rm containers and stay usable under --network=none.
 function modelCacheArgs() {
@@ -202,7 +223,7 @@ async function qtmesh(args, { inDir, outDir, timeoutMs, onSpawn }) {
   return runProcess('docker', [
     'run', '--rm',
     '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-    '--memory=4g', '--cpus=2', '--pids-limit=256',
+    `--memory=${cfg.jobMemory || DEFAULT_JOB_MEMORY}`, '--cpus=2', '--pids-limit=256',
     '--mount', `type=bind,src=${inDir},dst=/input,readonly`,
     '--mount', `type=bind,src=${outDir},dst=/output`,
     ...modelCacheArgs(),
@@ -230,6 +251,15 @@ function isExecutorFailure(out) {
 function ensureExecutorOk(out, what) {
   if (isExecutorFailure(out)) {
     throw new JobError('executor_unavailable', `${what}: executor failure: ${(out.stderr || out.stdout).slice(0, 300)}`, true);
+  }
+  // 128+SIGKILL(9): the kernel OOM-killer (or an operator) killed the container.
+  // It dies mid-write, so stdout/stderr are empty and the failure is otherwise
+  // indistinguishable from a bad asset -- which would permafail a valid job.
+  // The asset is fine; the box was too small. Retryable, and say so plainly.
+  if (out.code === 137 && !(out.stderr || out.stdout).trim()) {
+    throw new JobError('out_of_memory',
+      `${what}: killed (exit 137, no output) — likely OOM at --memory=${cfg.jobMemory || DEFAULT_JOB_MEMORY}. ` +
+      'Raise QTMESH_JOB_MEMORY or route this asset to a larger runner.', true);
   }
 }
 
@@ -636,6 +666,7 @@ async function preflightExecutor() {
   log('executor ok', {
     executor: `docker:${cfg.dockerImage}`,
     dockerServer: probe.stdout.trim(),
+    jobMemory: await resolveJobMemory(),
     ...(await executorVersion()),
   });
 }
